@@ -3,6 +3,7 @@
 #include <time.h>
 
 static int initialized = 0;
+
 Drone *create_drone(int id, int x, int y)
 {
     if (!initialized)
@@ -15,12 +16,13 @@ Drone *create_drone(int id, int x, int y)
         return NULL;
     drone->id = id;
     drone->status = IDLE;
-    drone->coord.x = (x == -1) ? (rand() % 40) : x; // 0-39
-    drone->coord.y = (y == -1) ? (rand() % 60) : y; // 0-59
+    drone->coord.x = (x == -1) ? (rand() % 40) : x;
+    drone->coord.y = (y == -1) ? (rand() % 60) : y;
     drone->target.x = drone->coord.x;
     drone->target.y = drone->coord.y;
     drone->battery = 100;
     drone->sock = 0;
+    drone->last_message_time = time(NULL); // YENİ: Başlangıç zamanı
     pthread_mutex_init(&drone->lock, NULL);
     return drone;
 }
