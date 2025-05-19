@@ -10,9 +10,11 @@
 #include "list.h"
 #include "drone.h"
 #include "survivor.h"
-
+#include "view.h"
 #define PORT 8080
+#define VIEW_PORT 8081 // Görselleştirme için ayrı port
 #define MAX_DRONES 50
+#define MAX_VIEWS 10
 
 int compare_survivor(void *a, void *b)
 {
@@ -30,7 +32,7 @@ int compare_drone(void *a, void *b)
 
 List *drone_list;
 List *survivor_list;
-
+List *view_sockets;
 void send_json(int sock, json_object *jobj)
 {
     const char *str = json_object_to_json_string(jobj);
@@ -314,8 +316,8 @@ void *survivor_generator(void *arg)
     static int survivor_id = 0;
     while (1)
     {
-        int x = rand() % 100;
-        int y = rand() % 100;
+        int x = rand() % 40; // 0-39
+        int y = rand() % 60; // 0-59
         int priority = (rand() % 3) + 1;
         Survivor *s = create_survivor(survivor_id++, x, y, priority);
         add_list(survivor_list, s);
@@ -324,24 +326,117 @@ void *survivor_generator(void *arg)
     }
     return NULL;
 }
-
-int main()
+void *handle_view_client(void *arg)
 {
-    srand(time(NULL));
-    drone_list = create_list();
-    survivor_list = create_list();
+    int sock = *(int *)arg;
+    free(arg);
+    char buffer[1024];
 
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in server_addr = {.sin_family = AF_INET, .sin_addr.s_addr = INADDR_ANY, .sin_port = htons(PORT)};
-    bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
-    listen(server_fd, MAX_DRONES);
+    int len = recv(sock, buffer, sizeof(buffer) - 1, 0);
+    if (len > 0)
+    {
+        buffer[len] = '\0';
+        json_object *jobj = json_tokener_parse(buffer);
+        if (jobj)
+        {
+            const char *type = json_object_get_string(json_object_object_get(jobj, "type"));
+            if (strcmp(type, "VIEW_HANDSHAKE") == 0)
+            {
+                int *sock_ptr = malloc(sizeof(int));
+                *sock_ptr = sock;
+                add_list(view_sockets, sock_ptr);
+                printf("View client connected, socket: %d\n", sock);
+            }
+            json_object_put(jobj);
+        }
+    }
 
-    pthread_t survivor_thread, controller_thread;
-    pthread_create(&survivor_thread, NULL, survivor_generator, NULL);
-    pthread_create(&controller_thread, NULL, controller, NULL);
-    pthread_detach(survivor_thread);
-    pthread_detach(controller_thread);
+    while (1)
+    {
+        len = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (len <= 0)
+            break;
+    }
 
+    pthread_mutex_lock(&view_sockets->lock);
+    remove_list(view_sockets, &sock, NULL);
+    pthread_mutex_unlock(&view_sockets->lock);
+    close(sock);
+    return NULL;
+}
+
+void *view_broadcast(void *arg)
+{
+    while (1)
+    {
+        json_object *state = json_object_new_object();
+        json_object_object_add(state, "type", json_object_new_string("STATE_UPDATE"));
+
+        json_object *drones = json_object_new_array();
+        pthread_mutex_lock(&drone_list->lock);
+        Node *d_node = drone_list->head;
+        while (d_node)
+        {
+            Drone *d = (Drone *)d_node->data;
+            pthread_mutex_lock(&d->lock);
+            json_object *d_obj = json_object_new_object();
+            json_object_object_add(d_obj, "id", json_object_new_int(d->id));
+            json_object *loc = json_object_new_object();
+            json_object_object_add(loc, "x", json_object_new_int(d->coord.x));
+            json_object_object_add(loc, "y", json_object_new_int(d->coord.y));
+            json_object_object_add(d_obj, "location", loc);
+            json_object_object_add(d_obj, "status", json_object_new_string(d->status == IDLE ? "idle" : "busy"));
+            json_object *target = json_object_new_object();
+            json_object_object_add(target, "x", json_object_new_int(d->target.x));
+            json_object_object_add(target, "y", json_object_new_int(d->target.y));
+            json_object_object_add(d_obj, "target", target);
+            json_object_object_add(d_obj, "battery", json_object_new_int(d->battery));
+            json_object_array_add(drones, d_obj);
+            pthread_mutex_unlock(&d->lock);
+            d_node = d_node->next;
+        }
+        pthread_mutex_unlock(&drone_list->lock);
+        json_object_object_add(state, "drones", drones);
+
+        json_object *survivors = json_object_new_array();
+        pthread_mutex_lock(&survivor_list->lock);
+        Node *s_node = survivor_list->head;
+        while (s_node)
+        {
+            Survivor *s = (Survivor *)s_node->data;
+            json_object *s_obj = json_object_new_object();
+            json_object_object_add(s_obj, "id", json_object_new_int(s->id));
+            json_object *loc = json_object_new_object();
+            json_object_object_add(loc, "x", json_object_new_int(s->coord.x));
+            json_object_object_add(loc, "y", json_object_new_int(s->coord.y));
+            json_object_object_add(s_obj, "location", loc);
+            json_object_object_add(s_obj, "priority", json_object_new_int(s->priority));
+            json_object_array_add(survivors, s_obj);
+            s_node = s_node->next;
+        }
+        pthread_mutex_unlock(&survivor_list->lock);
+        json_object_object_add(state, "survivors", survivors);
+
+        pthread_mutex_lock(&view_sockets->lock);
+        Node *v_node = view_sockets->head;
+        while (v_node)
+        {
+            int *sock = (int *)v_node->data;
+            send_json(*sock, state);
+            v_node = v_node->next;
+        }
+        pthread_mutex_unlock(&view_sockets->lock);
+
+        json_object_put(state);
+        sleep(1);
+    }
+    return NULL;
+}
+
+// Yeni fonksiyon: Drone istemcilerini kabul etmek için
+void *drone_accept(void *arg)
+{
+    int server_fd = *(int *)arg;
     while (1)
     {
         struct sockaddr_in client_addr;
@@ -352,9 +447,61 @@ int main()
         pthread_create(&thread, NULL, handle_drone, drone_fd);
         pthread_detach(thread);
     }
+    return NULL;
+}
+
+int main()
+{
+    srand(time(NULL));
+    drone_list = create_list();
+    survivor_list = create_list();
+    view_sockets = create_list();
+
+    // Drone soket dinleyici
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in server_addr = {.sin_family = AF_INET, .sin_addr.s_addr = INADDR_ANY, .sin_port = htons(PORT)};
+    bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    listen(server_fd, MAX_DRONES);
+
+    // Görselleştirme soket dinleyici
+    int view_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in view_addr = {.sin_family = AF_INET, .sin_addr.s_addr = INADDR_ANY, .sin_port = htons(VIEW_PORT)};
+    bind(view_fd, (struct sockaddr *)&view_addr, sizeof(view_addr));
+    listen(view_fd, MAX_VIEWS);
+
+    // Broadcast thread'i başlat
+    pthread_t broadcast_thread;
+    pthread_create(&broadcast_thread, NULL, view_broadcast, NULL);
+    pthread_detach(broadcast_thread);
+
+    // Survivor ve controller thread'leri
+    pthread_t survivor_thread, controller_thread;
+    pthread_create(&survivor_thread, NULL, survivor_generator, NULL);
+    pthread_create(&controller_thread, NULL, controller, NULL);
+    pthread_detach(survivor_thread);
+    pthread_detach(controller_thread);
+
+    // Drone istemcilerini kabul eden thread
+    pthread_t drone_accept_thread;
+    pthread_create(&drone_accept_thread, NULL, drone_accept, &server_fd);
+    pthread_detach(drone_accept_thread);
+
+    // Görselleştirme istemcilerini kabul et
+    while (1)
+    {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        int *view_fd_ptr = malloc(sizeof(int));
+        *view_fd_ptr = accept(view_fd, (struct sockaddr *)&client_addr, &addr_len);
+        pthread_t thread;
+        pthread_create(&thread, NULL, handle_view_client, view_fd_ptr);
+        pthread_detach(thread);
+    }
 
     close(server_fd);
+    close(view_fd);
     destroy_list(drone_list, free_drone);
     destroy_list(survivor_list, free_survivor);
+    destroy_list(view_sockets, free);
     return 0;
 }

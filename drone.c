@@ -3,7 +3,6 @@
 #include <time.h>
 
 static int initialized = 0;
-
 Drone *create_drone(int id, int x, int y)
 {
     if (!initialized)
@@ -16,12 +15,12 @@ Drone *create_drone(int id, int x, int y)
         return NULL;
     drone->id = id;
     drone->status = IDLE;
-    drone->coord.x = (x == -1) ? (rand() % 100) : x;
-    drone->coord.y = (y == -1) ? (rand() % 100) : y;
+    drone->coord.x = (x == -1) ? (rand() % 40) : x; // 0-39
+    drone->coord.y = (y == -1) ? (rand() % 60) : y; // 0-59
     drone->target.x = drone->coord.x;
     drone->target.y = drone->coord.y;
     drone->battery = 100;
-    drone->sock = 0; // Only if sock is added to Drone struct; otherwise, remove this line
+    drone->sock = 0;
     pthread_mutex_init(&drone->lock, NULL);
     return drone;
 }
