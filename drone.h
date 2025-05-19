@@ -6,23 +6,24 @@
 typedef enum
 {
     IDLE,
-    ON_MISSION,
-    CHARGING
+    ON_MISSION
 } DroneStatus;
 
 typedef struct
 {
-    int x, y;
-} Coord;
+    int x;
+    int y;
+} Coordinate;
 
 typedef struct
 {
     int id;
     DroneStatus status;
-    Coord coord;
-    Coord target;
+    Coordinate coord;
+    Coordinate target;
     int battery;
-    pthread_mutex_t lock; // Drone-specific lock
+    int sock; // Add socket descriptor
+    pthread_mutex_t lock;
 } Drone;
 
 Drone *create_drone(int id, int x, int y);

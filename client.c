@@ -4,8 +4,8 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <arpa/inet.h> // Added for inet_pton
-#include <stdbool.h>   // Added for true
+#include <arpa/inet.h>
+#include <stdbool.h>
 #include <json-c/json.h>
 #include "drone.h"
 
@@ -35,28 +35,76 @@ void send_json(int sock, json_object *jobj)
 void *navigate_to_target(void *arg)
 {
     Drone *d = (Drone *)arg;
-    int sock = d->id;
+    int sock = d->sock;
+    int move_count = 0; // Hareket sayacı
+
     while (1)
     {
         pthread_mutex_lock(&d->lock);
+        if (d->battery <= 0)
+        {
+            d->status = IDLE;
+            printf("Drone %d: Battery depleted, stopping\n", d->id);
+            json_object *jobj = json_object_new_object();
+            json_object_object_add(jobj, "type", json_object_new_string("BATTERY_DEPLETED"));
+            char drone_id[10];
+            snprintf(drone_id, sizeof(drone_id), "D%d", d->id);
+            json_object_object_add(jobj, "drone_id", json_object_new_string(drone_id));
+            json_object_object_add(jobj, "timestamp", json_object_new_int(time(NULL)));
+            send_json(sock, jobj);
+            json_object_put(jobj);
+            pthread_mutex_unlock(&d->lock);
+            break;
+        }
+
         if (d->status == ON_MISSION)
         {
+            int moved = 0; // Hareket olup olmadığını takip et
             if (d->coord.x < d->target.x)
+            {
                 d->coord.x++;
+                moved = 1;
+            }
             else if (d->coord.x > d->target.x)
+            {
                 d->coord.x--;
-            if (d->coord.y < d->target.y)
-                d->coord.y++;
-            else if (d->coord.y > d->target.y)
-                d->coord.y--;
-            d->battery--;
+                moved = 1;
+            }
+            if (d->coord.x == d->target.x)
+            {
+                if (d->coord.y < d->target.y)
+                {
+                    d->coord.y++;
+                    moved = 1;
+                }
+                else if (d->coord.y > d->target.y)
+                {
+                    d->coord.y--;
+                    moved = 1;
+                }
+            }
+
+            if (moved)
+            {
+                move_count++;
+                if (move_count >= 5)
+                {
+                    d->battery--;   // Her 5 harekette batarya 1 azalır
+                    move_count = 0; // Sayaç sıfırlanır
+                }
+            }
+
+            printf("Drone %d at (%d, %d), moving to (%d, %d), battery: %d, move_count: %d\n",
+                   d->id, d->coord.x, d->coord.y, d->target.x, d->target.y, d->battery, move_count);
 
             if (d->coord.x == d->target.x && d->coord.y == d->target.y)
             {
                 d->status = IDLE;
                 json_object *jobj = json_object_new_object();
                 json_object_object_add(jobj, "type", json_object_new_string("MISSION_COMPLETE"));
-                json_object_object_add(jobj, "drone_id", json_object_new_string("D1"));
+                char drone_id[10];
+                snprintf(drone_id, sizeof(drone_id), "D%d", d->id);
+                json_object_object_add(jobj, "drone_id", json_object_new_string(drone_id));
                 json_object_object_add(jobj, "mission_id", json_object_new_string("M123"));
                 json_object_object_add(jobj, "timestamp", json_object_new_int(time(NULL)));
                 json_object_object_add(jobj, "success", json_object_new_boolean(true));
@@ -74,13 +122,15 @@ void *navigate_to_target(void *arg)
 void *send_status_update(void *arg)
 {
     Drone *d = (Drone *)arg;
-    int sock = d->id;
+    int sock = d->sock;
     while (1)
     {
         pthread_mutex_lock(&d->lock);
         json_object *jobj = json_object_new_object();
         json_object_object_add(jobj, "type", json_object_new_string("STATUS_UPDATE"));
-        json_object_object_add(jobj, "drone_id", json_object_new_string("D1"));
+        char drone_id[10];
+        snprintf(drone_id, sizeof(drone_id), "D%d", d->id);
+        json_object_object_add(jobj, "drone_id", json_object_new_string(drone_id));
         json_object_object_add(jobj, "timestamp", json_object_new_int(time(NULL)));
         json_object *loc = json_object_new_object();
         json_object_object_add(loc, "x", json_object_new_int(d->coord.x));
@@ -97,17 +147,30 @@ void *send_status_update(void *arg)
     return NULL;
 }
 
-int main()
+int main(int argc, char *argv[])
 {
+    if (argc < 2)
+    {
+        fprintf(stderr, "Kullanım: %s <drone_id>\n", argv[0]);
+        return 1;
+    }
+
     int sock = connect_to_server();
     if (sock < 0)
         return 1;
 
-    Drone *drone = create_drone(sock, 0, 0);
+    char *id_str = argv[1];
+    if (id_str[0] == 'D')
+        id_str++;
+    int drone_id = atoi(id_str);
+    Drone *drone = create_drone(drone_id, -1, -1);
+    drone->sock = sock;
 
     json_object *handshake = json_object_new_object();
     json_object_object_add(handshake, "type", json_object_new_string("HANDSHAKE"));
-    json_object_object_add(handshake, "drone_id", json_object_new_string("D1"));
+    char drone_id_str[10];
+    snprintf(drone_id_str, sizeof(drone_id_str), "D%d", drone_id);
+    json_object_object_add(handshake, "drone_id", json_object_new_string(drone_id_str));
     json_object *caps = json_object_new_object();
     json_object_object_add(caps, "max_speed", json_object_new_int(30));
     json_object_object_add(caps, "battery_capacity", json_object_new_int(100));

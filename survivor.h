@@ -1,12 +1,12 @@
 #ifndef SURVIVOR_H
 #define SURVIVOR_H
 
-#include "drone.h" // Include drone.h for Coord definition
+#include "drone.h" // Coordinate tanımı için drone.h'yi dahil et
 
 typedef struct
 {
     int id;
-    Coord coord;
+    Coordinate coord; // Coord yerine Coordinate kullan
     int priority;
 } Survivor;
 
