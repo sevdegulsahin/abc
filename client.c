@@ -126,6 +126,12 @@ void *send_status_update(void *arg)
     while (1)
     {
         pthread_mutex_lock(&d->lock);
+        if (d->sock <= 0)
+        { // Drone sonlandırılmışsa veya soket kapalıysa thread'i bitir
+            pthread_mutex_unlock(&d->lock);
+            break;
+        }
+
         json_object *jobj = json_object_new_object();
         json_object_object_add(jobj, "type", json_object_new_string("STATUS_UPDATE"));
         char drone_id[10];
@@ -138,11 +144,14 @@ void *send_status_update(void *arg)
         json_object_object_add(jobj, "location", loc);
         json_object_object_add(jobj, "status", json_object_new_string(d->status == IDLE ? "idle" : "busy"));
         json_object_object_add(jobj, "battery", json_object_new_int(d->battery));
-        json_object_object_add(jobj, "speed", json_object_new_int(5));
+        json_object_object_add(jobj, "speed", json_object_new_int(5)); // Bu 1 birim/saniye hızı temsil ediyor olabilir
         send_json(sock, jobj);
         json_object_put(jobj);
         pthread_mutex_unlock(&d->lock);
-        sleep(5);
+        // sleep(5); // ESKİ
+        usleep(500000); // YENİ: Yarım saniyede bir güncelleme (0.5 saniye)
+                        // Veya sleep(1) saniyede bir. GUI'nin tepkiselliğine göre ayarlayın.
+                        // Çok sık göndermek ağı ve sunucuyu yorabilir.
     }
     return NULL;
 }
@@ -185,34 +194,101 @@ int main(int argc, char *argv[])
     pthread_detach(navigate_thread);
     pthread_detach(status_thread);
 
-    char buffer[1024];
+    char buffer[4096];
+    char process_buf[4096 * 2] = {0}; // Gelen mesajları biriktirmek ve işlemek için
+    int process_buf_len = 0;
+
     while (1)
     {
         int len = recv(sock, buffer, sizeof(buffer) - 1, 0);
         if (len <= 0)
+        {
+            printf("Drone %d: Server connection closed or error.\n", drone->id);
             break;
+        }
         buffer[len] = '\0';
 
-        json_object *jobj = json_tokener_parse(buffer);
-        if (!jobj)
-            continue;
-
-        const char *type = json_object_get_string(json_object_object_get(jobj, "type"));
-        if (strcmp(type, "ASSIGN_MISSION") == 0)
+        if (process_buf_len + len < sizeof(process_buf))
         {
-            pthread_mutex_lock(&drone->lock);
-            json_object *target = json_object_object_get(jobj, "target");
-            drone->target.x = json_object_get_int(json_object_object_get(target, "x"));
-            drone->target.y = json_object_get_int(json_object_object_get(target, "y"));
-            drone->status = ON_MISSION;
-            printf("Drone %d assigned mission to (%d, %d)\n", drone->id, drone->target.x, drone->target.y);
-            pthread_mutex_unlock(&drone->lock);
+            strcat(process_buf, buffer);
+            process_buf_len += len;
+        }
+        else
+        {
+            fprintf(stderr, "Drone %d: Processing buffer overflow, discarding data.\n", drone->id);
+            process_buf[0] = '\0'; // Hata durumunda tamponu temizle
+            process_buf_len = 0;
+            // İsteğe bağlı: drone'u yeniden başlat veya güvenli bir şekilde kapat
+            continue;
         }
 
-        json_object_put(jobj);
+        char *msg_start = process_buf;
+        char *msg_end;
+
+        // Tamponda '\n' ile ayrılmış tüm mesajları işle
+        while ((msg_end = strchr(msg_start, '\n')) != NULL)
+        {
+            *msg_end = '\0'; // Mesajı ayır
+
+            json_object *jobj = json_tokener_parse(msg_start);
+            if (!jobj)
+            {
+                // Hatalı JSON formatı, bu kısmı atla veya logla
+                // fprintf(stderr, "Drone %d: Failed to parse JSON: %s\n", drone->id, msg_start);
+                msg_start = msg_end + 1; // Bir sonraki potansiyel mesaj başlangıcına geç
+                continue;
+            }
+
+            const char *type_str = json_object_get_string(json_object_object_get(jobj, "type"));
+            if (type_str && strcmp(type_str, "ASSIGN_MISSION") == 0)
+            {
+                pthread_mutex_lock(&drone->lock);
+                json_object *target_json_obj = json_object_object_get(jobj, "target");
+                if (target_json_obj)
+                {
+                    drone->target.x = json_object_get_int(json_object_object_get(target_json_obj, "x"));
+                    drone->target.y = json_object_get_int(json_object_object_get(target_json_obj, "y"));
+                    drone->status = ON_MISSION;
+                    printf("Drone %d assigned mission to (%d, %d)\n", drone->id, drone->target.x, drone->target.y);
+                }
+                else
+                {
+                    fprintf(stderr, "Drone %d: ASSIGN_MISSION message missing 'target' object.\n", drone->id);
+                }
+                pthread_mutex_unlock(&drone->lock);
+            }
+            // Diğer mesaj türleri (varsa) burada işlenebilir
+
+            json_object_put(jobj);
+            msg_start = msg_end + 1; // Bir sonraki mesajın başlangıcına git
+        }
+
+        // Kalan (tamamlanmamış) mesajı tamponun başına taşı
+        if (*msg_start != '\0')
+        {
+            memmove(process_buf, msg_start, strlen(msg_start) + 1);
+            process_buf_len = strlen(process_buf);
+        }
+        else
+        {
+            process_buf[0] = '\0';
+            process_buf_len = 0;
+        }
     }
 
-    close(sock);
+    // ...
+    // Ana döngü bittiğinde thread'lerin de sonlanmasını sağla
+    pthread_mutex_lock(&drone->lock);
+    drone->sock = 0; // navigate_to_target ve send_status_update'in döngülerini kırması için işaret
+    pthread_mutex_unlock(&drone->lock);
+
+    // Thread'leri join etmek daha iyi bir uygulama olacaktır.
+    // pthread_join(navigate_thread, NULL);
+    // pthread_join(status_thread, NULL);
+    // Eğer detach edildiyse, main bittiğinde onlar da sonlanır.
+
+    close(sock); // drone->sock üzerinden kapatılıyordu, burada kapatmaya gerek yok eğer free_drone hallediyorsa.
+                 // drone->sock'u sıfırlamak yeterli.
     free_drone(drone);
     return 0;
 }
